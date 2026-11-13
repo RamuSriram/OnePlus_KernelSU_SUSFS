@@ -1,0 +1,479 @@
+name: Build OP12 A16 6.1.157 (WildKernels)
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'KernelSU variant'
+        required: true
+        type: choice
+        options:
+          - KSUN
+          - KSU
+        default: KSUN
+      ksu_branch_or_hash:
+        description: 'KSU branch, tag, or commit hash (leave empty for dev/main)'
+        required: false
+        type: string
+        default: ''
+      susfs_branch_or_commit:
+        description: 'SUSFS branch or commit hash (leave empty for gki-android14-6.1)'
+        required: false
+        type: string
+        default: ''
+      bbg:
+        description: 'Enable Baseband-Guard (BBG LSM)'
+        required: true
+        type: boolean
+        default: true
+      opt:
+        description: 'Apply WildKernels optimization patches'
+        required: true
+        type: boolean
+        default: true
+      unicode:
+        description: 'Apply Unicode bypass fix patch'
+        required: true
+        type: boolean
+        default: true
+      bbr3:
+        description: 'Enable BBR & BBRv3 TCP congestion control'
+        required: true
+        type: boolean
+        default: false
+      ds:
+        description: 'Enable Droidspaces container support (SYSVIPC/USER_NS/MACVLAN)'
+        required: true
+        type: boolean
+        default: false
+      ntsync:
+        description: 'Enable NTSync patch'
+        required: true
+        type: boolean
+        default: false
+      ttl_and_ip_set:
+        description: 'Enable TTL target & IP_SET / IPv6 NAT support'
+        required: true
+        type: boolean
+        default: false
+      optimize_level:
+        description: 'Compiler optimization level'
+        required: true
+        type: choice
+        options: [O2, O3]
+        default: O2
+      mlgo:
+        description: 'Enable MLGO (Machine Learning Guided Optimization)'
+        required: false
+        type: boolean
+        default: true
+      uname:
+        description: 'Kernel uname suffix (LOCALVERSION suffix after -android14-)'
+        required: false
+        type: string
+        default: 'OP-WILD'
+      build_timestamp:
+        description: 'Custom kernel build timestamp for uname -a (empty = current UTC time)'
+        required: false
+        type: string
+        default: ''
+      make_release:
+        description: 'Publish GitHub Release (also attaches matching KSU/KSUN Manager APK)'
+        required: true
+        type: boolean
+        default: false
+      clean_build:
+        description: 'Clean build (skip ccache)'
+        required: true
+        type: boolean
+        default: false
+      debug:
+        description: 'Enable debug logs and artifacts'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  prepare:
+    name: Prepare OP12 6.1.157 config, hashes & toolchain cache
+    runs-on: ubuntu-24.04
+    outputs:
+      op_config_json: ${{ steps.resolve.outputs.op_config_json }}
+      ksu_resolved_hash: ${{ steps.resolve.outputs.ksu_resolved_hash }}
+      ksu_type_lower: ${{ steps.resolve.outputs.ksu_type_lower }}
+      susfs_resolved_hash: ${{ steps.resolve.outputs.susfs_resolved_hash }}
+      susfs_base_version: ${{ steps.resolve.outputs.susfs_base_version }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve KSU, SUSFS & OP12 6.1.157 JSON config
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ksu_type="${{ inputs.ksu_type }}"
+          ksu_ref="${{ inputs.ksu_branch_or_hash }}"
+          if [ -z "$ksu_ref" ]; then
+            if [ "$ksu_type" = "KSUN" ]; then
+              ksu_ref="dev"
+            else
+              ksu_ref="main"
+            fi
+          fi
+
+          if [ "$ksu_type" = "KSUN" ]; then
+            KSU_REPO_OWNER="KernelSU-Next"
+            KSU_REPO_NAME="KernelSU-Next"
+            echo "ksu_type_lower=ksun" >> "$GITHUB_OUTPUT"
+          else
+            KSU_REPO_OWNER="tiann"
+            KSU_REPO_NAME="KernelSU"
+            echo "ksu_type_lower=ksu" >> "$GITHUB_OUTPUT"
+          fi
+
+          QUERY='query($owner: String!, $name: String!, $headRef: String!, $tagRef: String!, $objRef: String!) {
+            repository(owner: $owner, name: $name) {
+              hb: ref(qualifiedName: $headRef) { t: target { ... on Commit { o: oid } } }
+              ht: ref(qualifiedName: $tagRef) { t: target { ... on Commit { o: oid } } }
+              ho: object(expression: $objRef) { ... on Commit { o: oid } }
+            }
+          }'
+
+          resolved_ksu=""
+          for attempt in 1 2 3; do
+            RESULT=$(gh api graphql -f query="$QUERY" \
+              -f owner="$KSU_REPO_OWNER" \
+              -f name="$KSU_REPO_NAME" \
+              -f headRef="refs/heads/${ksu_ref}" \
+              -f tagRef="refs/tags/${ksu_ref}" \
+              -f objRef="$ksu_ref" 2>/dev/null || true)
+            if [ -n "$RESULT" ]; then
+              resolved_ksu=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "")')
+              if [ -n "$resolved_ksu" ] && [ "$resolved_ksu" != "null" ]; then
+                break
+              fi
+            fi
+            sleep 5
+          done
+
+          if [ -z "$resolved_ksu" ] || [ "$resolved_ksu" = "null" ]; then
+            echo "::error::Failed to resolve $ksu_type ref '$ksu_ref'"
+            exit 1
+          fi
+          echo "Resolved $ksu_type ($ksu_ref) -> $resolved_ksu"
+          echo "ksu_resolved_hash=$resolved_ksu" >> "$GITHUB_OUTPUT"
+
+          susfs_ref="${{ inputs.susfs_branch_or_commit }}"
+          if [ -z "$susfs_ref" ]; then
+            susfs_ref="gki-android14-6.1"
+          fi
+
+          GL_QUERY="{ project(fullPath: \"simonpunk/susfs4ksu\") { repository { ch: commit(ref: \"${susfs_ref}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${susfs_ref}\") { nodes { rawBlob } } } } }"
+          resolved_susfs=""
+          susfs_ver="v2.4.0"
+          for attempt in 1 2 3; do
+            RESPONSE=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY" || true)
+            if [ -n "$RESPONSE" ]; then
+              resolved_susfs=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty')
+              extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || true)
+              if [ -n "$resolved_susfs" ] && [ "$resolved_susfs" != "null" ]; then
+                [ -n "$extracted" ] && susfs_ver="$extracted"
+                break
+              fi
+            fi
+            sleep 5
+          done
+
+          if [ -z "$resolved_susfs" ]; then
+            echo "::error::Failed to resolve SUSFS ref '$susfs_ref' on GitLab"
+            exit 1
+          fi
+          echo "Resolved SUSFS ($susfs_ref) -> $resolved_susfs ($susfs_ver)"
+          echo "susfs_resolved_hash=$resolved_susfs" >> "$GITHUB_OUTPUT"
+          echo "susfs_base_version=$susfs_ver" >> "$GITHUB_OUTPUT"
+
+          cfg_json=$(jq -nc \
+            --slurpfile base configs/a16/OP12.json \
+            --arg uname_val "${{ inputs.uname }}" \
+            --argjson opt ${{ inputs.opt }} \
+            --argjson ds ${{ inputs.ds }} \
+            --argjson bbg ${{ inputs.bbg }} \
+            --argjson bbr3 ${{ inputs.bbr3 }} \
+            --argjson ttl_ip ${{ inputs.ttl_and_ip_set }} \
+            --argjson unicode ${{ inputs.unicode }} \
+            --argjson ntsync ${{ inputs.ntsync }} \
+            '$base[0] + {
+              model: "OP12-6.1.157",
+              manifest: "oneplus_13r_w.xml",
+              susfs: true,
+              opt: $opt,
+              ds: $ds,
+              bbg: $bbg,
+              bbr: $bbr3,
+              bbr3: $bbr3,
+              ttl: $ttl_ip,
+              ip_set: $ttl_ip,
+              unicode: $unicode,
+              ntsync: $ntsync,
+              uname: $uname_val
+            }')
+          echo "Generated OP12 6.1.157 config:"
+          echo "$cfg_json" | jq '.'
+          echo "op_config_json=$cfg_json" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure SM8650 6.1.157 toolchain-cache assets on fork
+        shell: python
+        env:
+          PYTHONUNBUFFERED: "1"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import xml.etree.ElementTree as ET
+          import subprocess
+          import urllib.request
+          import os
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = "toolchain-cache"
+          upstream_dl = f"https://github.com/WildKernels/OnePlus_KernelSU_SUSFS/releases/download/{tag}"
+          target_dl = f"https://github.com/{repo}/releases/download/{tag}"
+
+          TOOLCHAIN_MAP = {
+              "clang/host/linux-x86": "clang",
+              "prebuilts/rust": "rust",
+              "prebuilts/clang-tools": "clang-tools",
+              "kernel/prebuilts/build-tools": "build-tools",
+              "AnyKernel3": "AnyKernel3",
+          }
+
+          root = ET.parse("manifests/a16/oneplus_13r_w.xml").getroot()
+          needed = []
+          for proj in root.findall("project"):
+              name = proj.get("name", "")
+              rev = proj.get("revision", "")
+              for key, label in TOOLCHAIN_MAP.items():
+                  if key in name:
+                      needed.append(f"{label}-{rev}.tar.gz")
+                      break
+
+          print("Required toolchain assets:", needed)
+          missing = []
+          for asset in needed:
+              code = subprocess.check_output(
+                  ["curl", "-IsL", "-o", "/dev/null", "-w", "%{http_code}", f"{target_dl}/{asset}"],
+                  text=True,
+              ).strip()
+              if code != "200":
+                  missing.append(asset)
+              else:
+                  print(f"Already cached on fork: {asset}")
+
+          if missing:
+              rc = subprocess.run(["gh", "release", "view", tag, "--repo", repo], capture_output=True).returncode
+              if rc != 0:
+                  subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+                  subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+                  has_tag = subprocess.run(["git", "rev-parse", tag], capture_output=True).returncode == 0
+                  if not has_tag:
+                      env = os.environ.copy()
+                      env["GIT_COMMITTER_DATE"] = "2015-01-01T12:00:00"
+                      subprocess.run(["git", "tag", "-a", tag, "-m", "Internal Toolchains Cache"], env=env, check=True)
+                      subprocess.run(["git", "push", "origin", tag], check=True)
+                  subprocess.run(
+                      ["gh", "release", "create", tag, "--title", "Toolchains Mirror Cache", "--notes", "Deduplicated Toolchains for Kernel Build", "--repo", repo],
+                      check=True,
+                  )
+
+              for asset in missing:
+                  url = f"{upstream_dl}/{asset}"
+                  print(f"Mirroring {asset} from WildKernels toolchain-cache...")
+                  subprocess.run(["curl", "-LfsS", "--retry", "5", url, "-o", asset], check=True)
+                  subprocess.run(["gh", "release", "upload", tag, asset, "--clobber", "--repo", repo], check=True)
+                  os.remove(asset)
+
+      - name: Download custom ccache binary
+        run: |
+          set -uo pipefail
+          url="https://raw.githubusercontent.com/WildKernels/kernel_patches/refs/heads/main/ccache/ccache-x86-64"
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            if curl -LfsS --connect-timeout 30 --max-time 120 -H "User-Agent: Mozilla/5.0" "$url" -o ccache && [ -s ccache ]; then
+              ok=1
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::warning::custom ccache download failed; build job will fall back to apt ccache"
+            rm -f ccache
+          fi
+
+      - name: Upload ccache artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccache-binary
+          path: ccache
+          retention-days: 1
+          if-no-files-found: warn
+
+  build:
+    name: Build OP12 A16 6.1.157 (${{ inputs.ksu_type }})
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel_version: ${{ steps.build.outputs.kernel_version }}
+      ksu_version: ${{ steps.build.outputs.ksu_version }}
+      susfs_version: ${{ steps.build.outputs.susfs_version }}
+      zip_name: ${{ steps.build.outputs.zip_name }}
+      zip_sha256: ${{ steps.build.outputs.zip_sha256 }}
+      image_sha256: ${{ steps.build.outputs.image_sha256 }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install Minimal Dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils pigz
+          sudo apt-get clean
+
+      - name: Get prebuilt ccache
+        uses: actions/download-artifact@v8
+        with:
+          name: ccache-binary
+          path: ccache-dl
+        continue-on-error: true
+
+      - name: Install ccache
+        run: |
+          set -uo pipefail
+          if [ -s ccache-dl/ccache ]; then
+            sudo cp -f ccache-dl/ccache /usr/bin/ccache
+            sudo chmod +x /usr/bin/ccache
+          fi
+          rm -rf ccache-dl
+          ccache --version | head -n1
+
+      - name: Configure ccache environment
+        run: |
+          set -euo pipefail
+          CACHE_DIR="${{ github.workspace }}/.ccache"
+          CCACHE_LOG="${{ github.workspace }}/ccache.log"
+          mkdir -p "$CACHE_DIR"
+          SETTINGS=(
+            "CCACHE_DIR=$CACHE_DIR"
+            "CCACHE_MAXSIZE=12G"
+            "CCACHE_COMPILERCHECK=content"
+            "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            "CCACHE_NOHASHDIR=true"
+            "CCACHE_IGNOREOPTIONS=--sysroot*"
+            "CCACHE_COMPRESSION=true"
+            "CCACHE_COMPRESSION_LEVEL=3"
+            "CCACHE_DIRECT=true"
+            "CCACHE_FILE_CLONE=true"
+            "CCACHE_INODE_CACHE=true"
+            "CCACHE_IS_KERNEL_COMPILING=true"
+            "CCACHE_UMASK=002"
+            "CCACHE_LOGFILE=${CCACHE_LOG}"
+            "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+          )
+          for setting in "${SETTINGS[@]}"; do
+            export "$setting"
+            echo "$setting" >> "$GITHUB_ENV"
+          done
+          if ccache --help 2>&1 | grep -q 'depend_mode'; then
+            echo "CCACHE_DEPEND=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Kernel
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ needs.prepare.outputs.op_config_json }}
+          ksu_type: ${{ inputs.ksu_type }}
+          ksu_branch_or_hash: ${{ needs.prepare.outputs.ksu_resolved_hash }}
+          susfs_commit_hash_or_branch: ${{ needs.prepare.outputs.susfs_resolved_hash }}
+          optimize_level: ${{ inputs.optimize_level }}
+          mlgo: ${{ inputs.mlgo }}
+          build_timestamp: ${{ inputs.build_timestamp }}
+          clean: ${{ inputs.clean_build }}
+          debug: ${{ inputs.debug }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup build workspace
+        if: always()
+        run: |
+          sudo rm -rf "$GITHUB_WORKSPACE/out" "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/kernel/out" "$GITHUB_WORKSPACE/.repo" /tmp/* || true
+
+  release:
+    name: Publish OP12 6.1.157 Release
+    needs: [prepare, build]
+    if: ${{ !cancelled() && inputs.make_release == true && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./downloaded-artifacts
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Fetch matching KSU/KSUN Manager APK
+        uses: nullptr-t-oss/composite_actions/fetch_ksu_manager@main
+        continue-on-error: true
+        with:
+          ksu-type: ${{ needs.prepare.outputs.ksu_type_lower }}
+          dist-dir: ./downloaded-artifacts
+          commit-hash: ${{ needs.prepare.outputs.ksu_resolved_hash }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        run: |
+          set -euo pipefail
+          rm -f ./downloaded-artifacts/ccache-binary* ./downloaded-artifacts/*_ccache.log || true
+          TAG="OP12-6.1.157-${{ inputs.ksu_type }}-${{ needs.build.outputs.ksu_version }}-SuSFS-${{ needs.build.outputs.susfs_version }}-r${{ github.run_id }}"
+          cat << EOF > release_notes.md
+          # OnePlus 12 (SM8650 / A16) — ${{ needs.build.outputs.kernel_version }}
+
+          - **KSU Variant:** ${{ inputs.ksu_type }} v${{ needs.build.outputs.ksu_version }} (\`${{ needs.prepare.outputs.ksu_resolved_hash }}\`)
+          - **SuSFS:** ${{ needs.build.outputs.susfs_version }} (\`${{ needs.prepare.outputs.susfs_resolved_hash }}\`) + ADB/JDWP socket stealth + \`PRIORITY_UID_FILTER\`
+          - **Baseband-Guard:** ${{ inputs.bbg }}
+          - **BBR / BBRv3:** ${{ inputs.bbr3 }}
+          - **Droidspaces / NTSync:** ${{ inputs.ds }} / ${{ inputs.ntsync }}
+          - **TTL / IP_SET:** ${{ inputs.ttl_and_ip_set }}
+          - **Optimization:** ${{ inputs.optimize_level }} (MLGO: ${{ inputs.mlgo }})
+          - **ZIP:** \`${{ needs.build.outputs.zip_name }}\` (SHA256: \`${{ needs.build.outputs.zip_sha256 }}\`)
+          EOF
+          mapfile -t release_files < <(find ./downloaded-artifacts -maxdepth 1 -type f \( -name '*.zip' -o -name '*.apk' \) | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "::error::No release files found in ./downloaded-artifacts"
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "OP12 A16 6.1.157 (${{ inputs.ksu_type }} ${{ needs.build.outputs.ksu_version }} + SuSFS ${{ needs.build.outputs.susfs_version }})" \
+            --notes-file release_notes.md \
+            "${release_files[@]}"
